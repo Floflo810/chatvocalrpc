@@ -1,5 +1,16 @@
+#ifndef UNICODE
 #define UNICODE
+#endif
+
+#ifndef _UNICODE
 #define _UNICODE
+#endif
+
+// windows.h définit sinon des macros min/max qui cassent std::min/std::max.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 #include <windows.h>
 #include <windowsx.h>
 #include <string>
