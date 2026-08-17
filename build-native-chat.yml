@@ -1,0 +1,37 @@
+name: Build Native Chat Overlay
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "native_chat/native_chat_overlay.cpp"
+      - ".github/workflows/build-native-chat.yml"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Enable MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build x64 static runtime
+        shell: cmd
+        run: >-
+          cl /nologo /std:c++17 /O2 /EHsc /MT /utf-8
+          /DUNICODE /D_UNICODE
+          native_chat\native_chat_overlay.cpp
+          user32.lib gdi32.lib
+          /link /SUBSYSTEM:WINDOWS
+          /OUT:native_chat\native_chat_overlay.exe
+
+      - name: Upload EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-chat-overlay-x64
+          path: native_chat/native_chat_overlay.exe
+          if-no-files-found: error
