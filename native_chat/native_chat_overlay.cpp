@@ -13,11 +13,7 @@
 
 #include <windows.h>
 #include <windowsx.h>
-#include <gdiplus.h>
 #include <string>
-#include <memory>
-#include <cstring>
-#include <utility>
 #include <vector>
 #include <deque>
 #include <map>
@@ -26,10 +22,9 @@
 #include <algorithm>
 #include <cwctype>
 
-#pragma comment(lib, "gdiplus.lib")
-
 static const UINT WM_PIPE_LINE = WM_APP + 10;
 static const UINT TIMER_GAME_MODE = 101;
+static const UINT TIMER_PARENT_WATCH = 102;
 static const int MAX_INPUT = 500;
 
 struct ChatMessage {
@@ -42,27 +37,15 @@ struct ChatMessage {
     bool mine = false;
 };
 
-struct NearbyPlayerNative {
-    std::wstring userId;
-    std::wstring username;
-    double distance = 0.0;
-    bool speaking = false;
-    bool muted = false;
-    double volume = 1.0;
-    std::wstring language;
-    std::wstring server;
-};
-
-struct GroupMemberNative {
-    std::wstring username;
-    bool owner = false;
-    std::wstring language;
-    std::wstring server;
-};
-
 struct RectI { int l=0,t=0,r=0,b=0; bool contains(int x,int y) const { return x>=l && x<r && y>=t && y<b; } };
 
 static HWND g_hwnd = nullptr;
+static HWND g_previousForeground = nullptr;
+
+// PID du Rich Presence Python qui a lancé cet overlay.
+// Si le parent disparaît (fermeture, crash, taskkill), l'overlay se ferme.
+static DWORD g_parentPid = 0;
+static HANDLE g_parentProcess = nullptr;
 static HANDLE g_stdout = INVALID_HANDLE_VALUE;
 static std::mutex g_writeMutex;
 static std::map<std::wstring, std::deque<ChatMessage>> g_messages;
@@ -75,17 +58,7 @@ static bool g_visible = false;
 static bool g_gameMode = true;
 static bool g_groupActive = false;
 static std::wstring g_groupName = L"Groupe";
-static std::wstring g_groupInvite;
-static int g_groupMax = 25;
-static std::vector<GroupMemberNative> g_groupMembers;
 static int g_nearbyCount = 0;
-static std::vector<NearbyPlayerNative> g_nearbyPlayers;
-
-static bool g_voiceEnabled = true;
-static bool g_muted = false;
-static bool g_deafened = false;
-static std::wstring g_proxVoiceStatus = L"Vocal proximité arrêté";
-static int g_proxVoiceTone = 0; // 0 muted, 1 green, 2 orange, 3 red
 static bool g_dragging = false;
 static POINT g_dragStart{};
 static RECT g_windowStart{};
@@ -97,25 +70,12 @@ static std::wstring g_tabProximity = L"Proximité";
 static std::wstring g_tabGroup = L"Groupe";
 static std::wstring g_placeholder = L"Écrire un message…";
 static std::wstring g_manage = L"Gérer groupe";
-static std::wstring g_voiceLabel = L"Vocal proximité";
-static std::wstring g_micLabel = L"Micro";
-static std::wstring g_soundLabel = L"Son";
-static std::wstring g_nearbyLabel = L"Joueurs proches";
-static std::wstring g_noNearbyLabel = L"Aucun joueur proche";
-static std::wstring g_membersLabel = L"Membres";
-static std::wstring g_settingsLabel = L"Réglages";
-static std::wstring g_copyLabel = L"Copier";
-static std::wstring g_leaveLabel = L"Quitter";
 
 static HFONT g_fontTitle = nullptr;
 static HFONT g_fontTab = nullptr;
 static HFONT g_fontName = nullptr;
 static HFONT g_fontText = nullptr;
 static HFONT g_fontSmall = nullptr;
-static HFONT g_fontTiny = nullptr;
-
-static ULONG_PTR g_gdiplusToken = 0;
-static std::map<std::wstring, std::unique_ptr<Gdiplus::Image>> g_icons;
 
 static RectI g_tabRects[4];
 static RectI g_inputRect;
@@ -123,15 +83,6 @@ static RectI g_sendRect;
 static RectI g_closeRect;
 static RectI g_manageRect;
 static RectI g_titleDragRect;
-static RectI g_minRect;
-static RectI g_maxRect;
-static RectI g_settingsRect;
-static RectI g_voiceToggleRect;
-static RectI g_micRect;
-static RectI g_deafRect;
-static std::vector<RectI> g_nearbyMuteRects;
-static RectI g_groupCopyRect;
-static RectI g_groupLeaveRect;
 
 static COLORREF C_BG = RGB(24, 19, 30);
 static COLORREF C_PANEL = RGB(31, 25, 38);
@@ -142,65 +93,6 @@ static COLORREF C_MUTED = RGB(170, 154, 178);
 static COLORREF C_PINK = RGB(230, 176, 214);
 static COLORREF C_GREEN = RGB(103, 201, 141);
 static COLORREF C_RED = RGB(225, 108, 125);
-static COLORREF C_ORANGE = RGB(229, 183, 103);
-static COLORREF C_GREEN_PANEL = RGB(62, 79, 75);
-static COLORREF C_GREEN_HOVER = RGB(70, 97, 86);
-static COLORREF C_DARK_RED = RGB(110, 50, 72);
-
-
-static std::wstring ExeDirectory() {
-    wchar_t buf[32768]{};
-    DWORD n = GetModuleFileNameW(nullptr, buf, (DWORD)(sizeof(buf) / sizeof(buf[0])));
-    if (!n) return L".";
-    std::wstring p(buf, n);
-    size_t s = p.find_last_of(L"\\/");
-    return s == std::wstring::npos ? L"." : p.substr(0, s);
-}
-
-static std::wstring ParentAssetsPath(const std::wstring& file) {
-    return ExeDirectory() + L"\\..\\assets\\" + file;
-}
-
-static void LoadIcon(const std::wstring& key, const std::vector<std::wstring>& candidates) {
-    for (const auto& name : candidates) {
-        std::wstring path = ParentAssetsPath(name);
-        DWORD attr = GetFileAttributesW(path.c_str());
-        if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY)) continue;
-        auto img = std::make_unique<Gdiplus::Image>(path.c_str());
-        if (img && img->GetLastStatus() == Gdiplus::Ok) {
-            g_icons[key] = std::move(img);
-            return;
-        }
-    }
-}
-
-static void LoadAssets() {
-    LoadIcon(L"logo", {L"bavarder.png"});
-    LoadIcon(L"general", {L"planete.png", L"general planete.png"});
-    LoadIcon(L"server", {L"stockage-serveur.png", L"stockage serveur.png", L"logoserveur.png"});
-    LoadIcon(L"proximity", {L"radar.png"});
-    LoadIcon(L"group", {L"groupe.png"});
-    LoadIcon(L"voice", {L"message-vocal.png", L"message vocal.png"});
-    LoadIcon(L"mic_on", {L"cercle.png", L"micro active cercle.png"});
-    LoadIcon(L"mic_off", {L"cercle (1).png", L"desactive cercle (1).png"});
-    LoadIcon(L"sound_on", {L"son.png", L"caque active son.png"});
-    LoadIcon(L"sound_off", {L"du-son.png", L"desactive du-son.png"});
-    LoadIcon(L"emoji", {L"lamour.png"});
-    LoadIcon(L"send", {L"envoyer-le-message.png"});
-    LoadIcon(L"min", {L"moins.png"});
-    LoadIcon(L"max", {L"plus.png"});
-    LoadIcon(L"settings", {L"reglage-du-son.png"});
-    LoadIcon(L"close", {L"multiplication.png"});
-}
-
-static bool DrawIcon(HDC dc, const std::wstring& key, int x, int y, int w, int h) {
-    auto it = g_icons.find(key);
-    if (it == g_icons.end() || !it->second) return false;
-    Gdiplus::Graphics gr(dc);
-    gr.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
-    gr.DrawImage(it->second.get(), Gdiplus::Rect(x, y, w, h));
-    return true;
-}
 
 static std::string HexEncodeUtf8(const std::wstring& w) {
     if (w.empty()) return "";
@@ -271,34 +163,6 @@ static void SendEvent(const std::string& name, const std::vector<std::wstring>& 
     FlushFileBuffers(g_stdout);
 }
 
-
-static double ToDouble(const std::wstring& s, double fallback = 0.0) {
-    try { return std::stod(s); } catch (...) { return fallback; }
-}
-
-static int ToInt(const std::wstring& s, int fallback = 0) {
-    try { return std::stoi(s); } catch (...) { return fallback; }
-}
-
-static void CopyUnicodeText(const std::wstring& text) {
-    if (text.empty() || !g_hwnd) return;
-    if (!OpenClipboard(g_hwnd)) return;
-    EmptyClipboard();
-    const size_t bytes = (text.size() + 1) * sizeof(wchar_t);
-    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, bytes);
-    if (h) {
-        void* p = GlobalLock(h);
-        if (p) {
-            memcpy(p, text.c_str(), bytes);
-            GlobalUnlock(h);
-            if (!SetClipboardData(CF_UNICODETEXT, h)) GlobalFree(h);
-            h = nullptr;
-        }
-        if (h) GlobalFree(h);
-    }
-    CloseClipboard();
-}
-
 static std::wstring Lower(std::wstring s) {
     std::transform(s.begin(), s.end(), s.begin(), [](wchar_t c){ return (wchar_t)towlower(c); });
     return s;
@@ -357,7 +221,20 @@ static void ApplyGameMode(bool gameMode) {
     InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
+static void ReturnToPreviousWindow() {
+    ApplyGameMode(true);
+    HWND target = g_previousForeground;
+    if (target && target != g_hwnd && IsWindow(target)) {
+        SetForegroundWindow(target);
+    }
+    SendEvent("GAMEMODE");
+}
+
 static void ShowInteractive() {
+    HWND fg = GetForegroundWindow();
+    if (fg && fg != g_hwnd) {
+        g_previousForeground = fg;
+    }
     g_visible = true;
     ShowWindow(g_hwnd, SW_SHOWNORMAL);
     ApplyGameMode(false);
@@ -407,34 +284,17 @@ static std::wstring ChannelLabel(const std::wstring& c) {
 }
 
 static void UpdateRects(int w, int h) {
-    const int sideW = std::max(235, std::min(280, w / 3));
-    const int bodyRight = w - 16;
-    const int sideL = bodyRight - sideW;
-    const int chatR = sideL - 8;
-
-    g_titleDragRect = {16, 8, w - 230, 62};
-    g_closeRect = {w - 48, 14, w - 14, 48};
-    g_settingsRect = {w - 88, 14, w - 54, 48};
-    g_maxRect = {w - 128, 14, w - 94, 48};
-    g_minRect = {w - 168, 14, w - 134, 48};
-    g_manageRect = {w - 278, 14, w - 176, 48};
-
-    int x = 14;
-    int tabW = (w - 28 - 18) / 4;
+    g_titleDragRect = {18, 10, w - 185, 48};
+    g_closeRect = {w - 45, 13, w - 15, 43};
+    g_manageRect = {w - 162, 13, w - 53, 43};
+    int x = 18;
+    int tabW = (w - 36 - 18) / 4;
     for (int i=0;i<4;i++) {
-        g_tabRects[i] = {x, 70, x + tabW, 112};
+        g_tabRects[i] = {x, 58, x + tabW, 91};
         x += tabW + 6;
     }
-
-    g_sendRect = {chatR - 58, h - 59, chatR - 12, h - 17};
-    g_inputRect = {28, h - 59, chatR - 66, h - 17};
-
-    g_voiceToggleRect = {w - 58, 139, w - 28, 159};
-    g_micRect = {sideL + 13, 174, sideL + (sideW - 20) / 2, 211};
-    g_deafRect = {sideL + (sideW - 20) / 2 + 7, 174, w - 28, 211};
-
-    g_groupCopyRect = {44, 153, 142, 184};
-    g_groupLeaveRect = {148, 153, 232, 184};
+    g_sendRect = {w - 98, h - 61, w - 18, h - 17};
+    g_inputRect = {18, h - 61, w - 107, h - 17};
 }
 
 static int CalcMessageHeight(HDC dc, const ChatMessage& m, int width) {
@@ -447,247 +307,53 @@ static int CalcMessageHeight(HDC dc, const ChatMessage& m, int width) {
 }
 
 static void PaintMessages(HDC dc, int w, int h) {
-    const int sideW = std::max(235, std::min(280, w / 3));
-    const int sideL = w - 16 - sideW;
-    const int chatR = sideL - 8;
-    int areaTop = 124;
-
-    RectI chatPanel{14, 124, chatR, h - 8};
-    FillRound(dc, chatPanel, 18, C_PANEL);
-    StrokeRound(dc, chatPanel, 18, C_BORDER);
-
-    if (g_channel == L"group" && !g_groupActive) {
-        RectI groupBar{27, 137, chatR - 13, 190};
-        FillRound(dc, groupBar, 12, RGB(24, 19, 30));
-        RECT a{groupBar.l + 12, groupBar.t + 8, groupBar.r - 150, groupBar.b - 8};
-        Text(dc, L"Aucun groupe actif", a, g_fontSmall, C_MUTED, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
-        g_manageRect = {groupBar.r - 135, groupBar.t + 10, groupBar.r - 9, groupBar.b - 10};
-        FillRound(dc, g_manageRect, 9, RGB(67, 52, 79));
-        RECT mr{g_manageRect.l,g_manageRect.t,g_manageRect.r,g_manageRect.b};
-        Text(dc, g_manage, mr, g_fontSmall, C_TEXT, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
-        areaTop = 197;
-    } else if (g_channel == L"group" && g_groupActive) {
-        RectI groupBar{27, 137, chatR - 13, 190};
-        FillRound(dc, groupBar, 12, RGB(24, 19, 30));
-        RECT a{groupBar.l + 12, groupBar.t + 5, groupBar.r - 220, groupBar.t + 25};
-        Text(dc, L"Votre groupe / lobby privé", a, g_fontTiny, C_MUTED, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
-        RECT b{groupBar.l + 12, groupBar.t + 25, groupBar.r - 220, groupBar.b - 5};
-        std::wstring gtxt = g_groupName;
-        if (!g_groupMembers.empty()) {
-            gtxt += L"   " + std::to_wstring((int)g_groupMembers.size()) + L"/" + std::to_wstring(g_groupMax);
-        }
-        Text(dc, gtxt, b, g_fontName, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-        g_groupCopyRect = {groupBar.r - 196, groupBar.t + 10, groupBar.r - 102, groupBar.b - 10};
-        g_groupLeaveRect = {groupBar.r - 96, groupBar.t + 10, groupBar.r - 8, groupBar.b - 10};
-        FillRound(dc, g_groupCopyRect, 9, C_PANEL2);
-        RECT cr{g_groupCopyRect.l, g_groupCopyRect.t, g_groupCopyRect.r, g_groupCopyRect.b};
-        Text(dc, g_copyLabel, cr, g_fontSmall, C_TEXT, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
-        FillRound(dc, g_groupLeaveRect, 9, C_DARK_RED);
-        RECT lr{g_groupLeaveRect.l, g_groupLeaveRect.t, g_groupLeaveRect.r, g_groupLeaveRect.b};
-        Text(dc, g_leaveLabel, lr, g_fontSmall, C_TEXT, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
-        areaTop = 197;
-    }
-
-    RectI area{27, areaTop, chatR - 13, h - 73};
-    // Le fond principal du chat est déjà dessiné ; ici on garde la zone messages transparente.
+    RectI area{18, 101, w - 18, h - 74};
+    FillRound(dc, area, 16, C_PANEL);
+    StrokeRound(dc, area, 16, C_BORDER);
 
     auto it = g_messages.find(g_channel);
     if (it == g_messages.end() || it->second.empty()) {
         std::wstring empty = L"Aucun message dans " + ChannelLabel(g_channel) + L" pour le moment.";
-        RECT rc{area.l + 30, area.t + 65, area.r - 30, area.b - 20};
+        RECT rc{area.l + 30, area.t + 80, area.r - 30, area.b - 20};
         Text(dc, empty, rc, g_fontText, C_MUTED, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX);
-    } else {
-        const auto& q = it->second;
-        int maxW = area.r - area.l - 20;
-        int avail = area.b - area.t - 10;
-        int used = 0;
-        size_t start = q.size();
-        while (start > 0) {
-            int mh = CalcMessageHeight(dc, q[start - 1], maxW - 24);
-            if (used + mh > avail && start < q.size()) break;
-            used += mh;
-            --start;
-            if (used >= avail) break;
-        }
-
-        int y = area.t + 4;
-        for (size_t i = start; i < q.size(); ++i) {
-            const auto& msg = q[i];
-            int mh = CalcMessageHeight(dc, msg, maxW - 24);
-            RectI bubble{area.l + 2, y, area.r - 2, std::min(area.b - 4, y + mh - 5)};
-            FillRound(dc, bubble, 12, msg.mine ? RGB(75, 59, 88) : C_PANEL2);
-
-            RECT nameRc{bubble.l + 12, bubble.t + 7, bubble.r - 12, bubble.t + 27};
-            Text(dc, msg.author.empty() ? L"Joueur" : msg.author, nameRc, g_fontName, C_PINK, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-
-            std::wstring meta;
-            if (!msg.language.empty()) meta += msg.language;
-            if (!msg.server.empty()) {
-                if (!meta.empty()) meta += L"  ·  ";
-                meta += msg.server;
-            }
-            if (!meta.empty()) {
-                RECT metaRc{bubble.l + 155, bubble.t + 8, bubble.r - 12, bubble.t + 26};
-                Text(dc, meta, metaRc, g_fontTiny, C_MUTED, DT_RIGHT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-            }
-
-            RECT msgRc{bubble.l + 12, bubble.t + 29, bubble.r - 12, bubble.b - 8};
-            Text(dc, msg.content, msgRc, g_fontText, C_TEXT, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
-            y += mh;
-            if (y >= area.b) break;
-        }
-    }
-
-    // Composer comme avant : emoji + champ + envoyer.
-    RectI composer{27, h - 65, chatR - 13, h - 14};
-    FillRound(dc, composer, 14, C_PANEL2);
-
-    RectI emojiRect{composer.l + 4, composer.t + 7, composer.l + 44, composer.b - 7};
-    if (!DrawIcon(dc, L"emoji", emojiRect.l + 8, emojiRect.t + 2, 22, 22)) {
-        RECT er{emojiRect.l,emojiRect.t,emojiRect.r,emojiRect.b};
-        Text(dc, L"♥", er, g_fontTitle, C_PINK, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
-    }
-
-    FillRound(dc, g_inputRect, 11, RGB(38, 30, 45));
-    std::wstring shown = g_input.empty() ? g_placeholder : g_input;
-    RECT inputRc{g_inputRect.l + 12, g_inputRect.t + 5, g_inputRect.r - 10, g_inputRect.b - 5};
-    Text(dc, shown, inputRc, g_fontText, g_input.empty() ? C_MUTED : C_TEXT,
-         DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
-
-    FillRound(dc, g_sendRect, 11, RGB(185, 160, 227));
-    if (!DrawIcon(dc, L"send", g_sendRect.l + 11, g_sendRect.t + 9, 24, 24)) {
-        RECT sr{g_sendRect.l,g_sendRect.t,g_sendRect.r,g_sendRect.b};
-        Text(dc, L"➤", sr, g_fontTitle, RGB(33,23,40), DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
-    }
-}
-
-static void PaintSidePanel(HDC dc, int w, int h) {
-    const int sideW = std::max(235, std::min(280, w / 3));
-    const int sideL = w - 16 - sideW;
-    RectI side{sideL, 124, w - 14, h - 8};
-    FillRound(dc, side, 18, C_PANEL);
-    StrokeRound(dc, side, 18, C_BORDER);
-
-    if (!DrawIcon(dc, L"voice", side.l + 13, side.t + 14, 22, 22)) {
-        RECT vr{side.l + 13, side.t + 13, side.l + 38, side.t + 39};
-        Text(dc, L"🎙", vr, g_fontTitle, C_TEXT, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
-    }
-    RECT vtitle{side.l + 42, side.t + 13, side.r - 55, side.t + 40};
-    Text(dc, g_voiceLabel, vtitle, g_fontName, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
-
-    // Petit switch visuel.
-    FillRound(dc, g_voiceToggleRect, 18, g_voiceEnabled ? RGB(131, 100, 160) : RGB(79, 68, 87));
-    int knob = g_voiceEnabled ? g_voiceToggleRect.r - 17 : g_voiceToggleRect.l + 3;
-    RectI kr{knob, g_voiceToggleRect.t + 3, knob + 14, g_voiceToggleRect.b - 3};
-    FillRound(dc, kr, 14, RGB(220, 221, 225));
-
-    FillRound(dc, g_micRect, 10, g_muted ? C_DARK_RED : C_GREEN_PANEL);
-    if (!DrawIcon(dc, g_muted ? L"mic_off" : L"mic_on", g_micRect.l + 20, g_micRect.t + 9, 18, 18)) {
-        RECT mr{g_micRect.l + 8,g_micRect.t,g_micRect.l + 42,g_micRect.b};
-        Text(dc, L"●", mr, g_fontText, g_muted ? C_RED : C_GREEN, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
-    }
-    RECT mtxt{g_micRect.l + 43,g_micRect.t,g_micRect.r - 5,g_micRect.b};
-    Text(dc, g_micLabel, mtxt, g_fontText, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
-
-    FillRound(dc, g_deafRect, 10, g_deafened ? C_DARK_RED : C_GREEN_PANEL);
-    if (!DrawIcon(dc, g_deafened ? L"sound_off" : L"sound_on", g_deafRect.l + 20, g_deafRect.t + 9, 18, 18)) {
-        RECT dr{g_deafRect.l + 8,g_deafRect.t,g_deafRect.l + 42,g_deafRect.b};
-        Text(dc, L"●", dr, g_fontText, g_deafened ? C_RED : C_GREEN, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
-    }
-    RECT dtxt{g_deafRect.l + 43,g_deafRect.t,g_deafRect.r - 5,g_deafRect.b};
-    Text(dc, g_soundLabel, dtxt, g_fontText, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
-
-    COLORREF statusColor = C_MUTED;
-    if (g_proxVoiceTone == 1) statusColor = C_GREEN;
-    else if (g_proxVoiceTone == 2) statusColor = C_ORANGE;
-    else if (g_proxVoiceTone == 3) statusColor = C_RED;
-    RECT stat{side.l + 14, side.t + 96, side.r - 12, side.t + 120};
-    Text(dc, L"• " + g_proxVoiceStatus, stat, g_fontTiny, statusColor, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-
-    g_nearbyMuteRects.clear();
-
-    if (g_channel == L"group") {
-        RECT head{side.l + 14, side.t + 137, side.r - 12, side.t + 160};
-        Text(dc, g_membersLabel, head, g_fontName, C_PINK, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
-
-        std::wstring sub = g_groupActive ? (g_groupName + L" · " + std::to_wstring((int)g_groupMembers.size()) + L"/" + std::to_wstring(g_groupMax))
-                                         : L"Aucun groupe actif";
-        RECT subr{side.l + 14, side.t + 160, side.r - 12, side.t + 180};
-        Text(dc, sub, subr, g_fontTiny, C_MUTED, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-
-        int y = side.t + 190;
-        for (size_t i=0; i<g_groupMembers.size() && y < side.b - 52; ++i) {
-            const auto& gm = g_groupMembers[i];
-            RectI row{side.l + 11, y, side.r - 11, y + 54};
-            FillRound(dc, row, 11, C_PANEL2);
-            RectI av{row.l + 8,row.t + 8,row.l + 44,row.t + 44};
-            FillRound(dc, av, 18, RGB(185,160,227));
-            std::wstring initial = gm.username.empty() ? L"?" : gm.username.substr(0,1);
-            RECT ar{av.l,av.t,av.r,av.b};
-            Text(dc, initial, ar, g_fontName, RGB(33,23,40), DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
-
-            std::wstring nm = (gm.owner ? L"♛ " : L"") + gm.username;
-            RECT nr{row.l + 52,row.t + 7,row.r - 8,row.t + 27};
-            Text(dc, nm, nr, g_fontSmall, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-            std::wstring meta = gm.language;
-            if (!gm.server.empty()) {
-                if (!meta.empty()) meta += L" · ";
-                meta += gm.server;
-            }
-            RECT mr{row.l + 52,row.t + 28,row.r - 8,row.b - 6};
-            Text(dc, meta, mr, g_fontTiny, C_MUTED, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-            y += 59;
-        }
         return;
     }
 
-    RECT head{side.l + 14, side.t + 137, side.r - 12, side.t + 160};
-    Text(dc, g_nearbyLabel, head, g_fontName, C_PINK, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
-    RECT subr{side.l + 14, side.t + 160, side.r - 12, side.t + 180};
-    std::wstring sub = std::to_wstring((int)g_nearbyPlayers.size()) + L" joueur(s) dans le rayon";
-    Text(dc, sub, subr, g_fontTiny, C_MUTED, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
-
-    if (g_nearbyPlayers.empty()) {
-        RECT empty{side.l + 18, side.t + 205, side.r - 18, side.b - 20};
-        Text(dc, g_noNearbyLabel, empty, g_fontText, C_MUTED, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX);
-        return;
+    const auto& q = it->second;
+    int maxW = area.r - area.l - 34;
+    int avail = area.b - area.t - 22;
+    int used = 0;
+    size_t start = q.size();
+    while (start > 0) {
+        int mh = CalcMessageHeight(dc, q[start - 1], maxW - 28);
+        if (used + mh > avail && start < q.size()) break;
+        used += mh;
+        --start;
+        if (used >= avail) break;
     }
 
-    int y = side.t + 188;
-    for (size_t i=0; i<g_nearbyPlayers.size() && y < side.b - 54; ++i) {
-        const auto& p = g_nearbyPlayers[i];
-        RectI row{side.l + 10, y, side.r - 10, y + 55};
-        FillRound(dc, row, 11, p.speaking ? RGB(47, 41, 55) : RGB(31,25,38));
+    int y = area.t + 12;
+    for (size_t i = start; i < q.size(); ++i) {
+        const auto& m = q[i];
+        int mh = CalcMessageHeight(dc, m, maxW - 28);
+        RectI bubble{area.l + 10, y, area.r - 10, std::min(area.b - 8, y + mh - 4)};
+        FillRound(dc, bubble, 12, m.mine ? RGB(75, 59, 88) : C_PANEL2);
 
-        RectI av{row.l + 7,row.t + 9,row.l + 43,row.t + 45};
-        FillRound(dc, av, 18, RGB(185,160,227));
-        std::wstring initial = p.username.empty() ? L"?" : p.username.substr(0,1);
-        RECT ar{av.l,av.t,av.r,av.b};
-        Text(dc, initial, ar, g_fontName, RGB(33,23,40), DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        RECT nameRc{bubble.l + 12, bubble.t + 7, bubble.r - 12, bubble.t + 27};
+        Text(dc, m.author.empty() ? L"Joueur" : m.author, nameRc, g_fontName, C_PINK, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
 
-        RECT nr{row.l + 50,row.t + 6,row.r - 82,row.t + 26};
-        Text(dc, p.username, nr, g_fontSmall, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        std::wstring meta;
+        if (!m.language.empty()) meta += L"  " + m.language;
+        if (!m.server.empty()) meta += L"  ·  " + m.server;
+        if (!meta.empty()) {
+            RECT metaRc{bubble.l + 150, bubble.t + 8, bubble.r - 12, bubble.t + 26};
+            Text(dc, meta, metaRc, g_fontSmall, C_MUTED, DT_RIGHT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        }
 
-        std::wstring meta = p.language;
-        if (!meta.empty()) meta += L" · ";
-        meta += std::to_wstring((int)(p.distance + 0.5)) + L" m";
-        RECT mr{row.l + 50,row.t + 27,row.r - 82,row.b - 5};
-        Text(dc, meta, mr, g_fontTiny, p.speaking ? C_GREEN : C_MUTED, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-
-        // Barres toujours vertes.
-        int bars = std::max(1, std::min(4, (int)(p.volume * 4.0 + 0.5)));
-        RECT br{row.r - 76,row.t + 7,row.r - 38,row.b - 7};
-        std::wstring barText;
-        for (int k=0;k<4;k++) barText += (k < bars ? L"▮" : L"▯");
-        Text(dc, barText, br, g_fontTiny, C_GREEN, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
-
-        RectI muteR{row.r - 36,row.t + 11,row.r - 6,row.b - 11};
-        FillRound(dc, muteR, 8, p.muted ? C_DARK_RED : RGB(49,72,63));
-        RECT mut{muteR.l,muteR.t,muteR.r,muteR.b};
-        Text(dc, p.muted ? L"×" : L"●", mut, g_fontSmall, p.muted ? C_RED : C_GREEN, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
-        g_nearbyMuteRects.push_back(muteR);
-
-        y += 59;
+        RECT msgRc{bubble.l + 12, bubble.t + 29, bubble.r - 12, bubble.b - 8};
+        Text(dc, m.content, msgRc, g_fontText, C_TEXT, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
+        y += mh;
+        if (y >= area.b) break;
     }
 }
 
@@ -699,64 +365,53 @@ static void PaintWindow(HDC dc, int w, int h) {
 
     UpdateRects(w, h);
 
-    // Header proche de l'ancienne UI.
-    RectI top{0,0,w,62};
-    FillRound(dc, top, 0, RGB(29,23,35));
-    if (!DrawIcon(dc, L"logo", 14, 14, 34, 34)) {
-        RectI logo{14,12,50,48}; FillRound(dc, logo, 12, RGB(51,40,61));
-    }
-
-    RECT titleRc{58, 9, w - 290, 34};
-    Text(dc, g_title, titleRc, g_fontTitle, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+    RECT titleRc{18, 12, w - 180, 39};
+    Text(dc, g_title, titleRc, g_fontTitle, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
 
     std::wstring st = L"● " + g_status;
     if (!g_server.empty()) st += L"  ·  " + g_server;
-    RECT statusRc{58, 32, w - 290, 53};
-    Text(dc, st, statusRc, g_fontTiny, g_connected ? C_GREEN : C_MUTED, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    RECT statusRc{18, 38, w - 190, 56};
+    Text(dc, st, statusRc, g_fontSmall, g_connected ? C_GREEN : C_MUTED, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
 
-    // LIVE badge
-    RectI live{w - 326, 17, w - 282, 45};
-    FillRound(dc, live, 9, RGB(52,41,64));
-    RECT lr{live.l,live.t,live.r,live.b};
-    Text(dc, L"LIVE", lr, g_fontTiny, C_PINK, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+    FillRound(dc, g_manageRect, 10, C_PANEL2);
+    RECT manageRc{g_manageRect.l, g_manageRect.t, g_manageRect.r, g_manageRect.b};
+    Text(dc, g_manage, manageRc, g_fontSmall, C_MUTED, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
 
-    auto paintTopButton = [&](const RectI& r, const std::wstring& icon, const std::wstring& fallback, COLORREF fg) {
-        FillRound(dc, r, 9, C_PANEL2);
-        if (!DrawIcon(dc, icon, r.l + 9, r.t + 9, r.r-r.l-18, r.b-r.t-18)) {
-            RECT rr{r.l,r.t,r.r,r.b};
-            Text(dc, fallback, rr, g_fontTitle, fg, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
-        }
-    };
-    paintTopButton(g_minRect, L"min", L"−", C_TEXT);
-    paintTopButton(g_maxRect, L"max", L"+", C_TEXT);
-    paintTopButton(g_settingsRect, L"settings", L"⚙", C_PINK);
-    paintTopButton(g_closeRect, L"close", L"×", C_RED);
+    FillRound(dc, g_closeRect, 10, RGB(62, 40, 50));
+    RECT closeRc{g_closeRect.l, g_closeRect.t, g_closeRect.r, g_closeRect.b};
+    Text(dc, L"×", closeRc, g_fontTitle, C_RED, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
 
-    // Onglets.
     std::wstring tabs[4] = {g_tabGeneral, g_tabServer, g_tabProximity, g_tabGroup};
     std::wstring keys[4] = {L"general",L"server",L"proximity",L"group"};
-    std::wstring icons[4] = {L"general",L"server",L"proximity",L"group"};
     for (int i=0;i<4;i++) {
         bool active = (g_channel == keys[i]);
-        FillRound(dc, g_tabRects[i], 11, active ? RGB(185,160,227) : RGB(24,19,30));
-        COLORREF txt = active ? RGB(33,23,40) : C_TEXT;
-        int iconX = g_tabRects[i].l + 18;
-        if (!DrawIcon(dc, icons[i], iconX, g_tabRects[i].t + 10, 22, 22)) {
-            iconX -= 10;
-        }
-        RECT r{iconX + 28, g_tabRects[i].t, g_tabRects[i].r - 8, g_tabRects[i].b};
+        FillRound(dc, g_tabRects[i], 10, active ? RGB(77, 58, 86) : C_PANEL2);
+        if (active) StrokeRound(dc, g_tabRects[i], 10, C_PINK);
+        RECT r{g_tabRects[i].l, g_tabRects[i].t, g_tabRects[i].r, g_tabRects[i].b};
         std::wstring label = tabs[i];
-        Text(dc, label, r, g_fontTab, txt, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        if (i == 2 && g_nearbyCount > 0) label += L" (" + std::to_wstring(g_nearbyCount) + L")";
+        if (i == 3 && g_groupActive) label += L" ✓";
+        Text(dc, label, r, g_fontTab, active ? C_TEXT : C_MUTED, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
     }
 
     PaintMessages(dc, w, h);
-    PaintSidePanel(dc, w, h);
+
+    FillRound(dc, g_inputRect, 13, C_PANEL2);
+    StrokeRound(dc, g_inputRect, 13, g_gameMode ? C_BORDER : C_PINK);
+    std::wstring shown = g_input.empty() ? g_placeholder : g_input;
+    RECT inputRc{g_inputRect.l + 13, g_inputRect.t + 5, g_inputRect.r - 12, g_inputRect.b - 5};
+    Text(dc, shown, inputRc, g_fontText, g_input.empty() ? C_MUTED : C_TEXT,
+         DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+
+    FillRound(dc, g_sendRect, 13, C_PINK);
+    RECT sendRc{g_sendRect.l, g_sendRect.t, g_sendRect.r, g_sendRect.b};
+    Text(dc, L"Envoyer", sendRc, g_fontTab, RGB(45,34,50), DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
 
     if (g_gameMode) {
-        RectI badge{w - 96, h - 31, w - 20, h - 10};
-        FillRound(dc, badge, 8, RGB(45,65,56));
+        RectI badge{w - 90, h - 92, w - 18, h - 70};
+        FillRound(dc, badge, 9, RGB(45, 65, 56));
         RECT br{badge.l,badge.t,badge.r,badge.b};
-        Text(dc, L"MODE JEU", br, g_fontTiny, C_GREEN, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        Text(dc, L"MODE JEU", br, g_fontSmall, C_GREEN, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
     }
 }
 
@@ -827,58 +482,6 @@ static void HandleCommand(const std::string& line) {
     } else if (cmd == "LABELS") {
         g_title = field(1); g_tabGeneral = field(2); g_tabServer = field(3); g_tabProximity = field(4);
         g_tabGroup = field(5); g_placeholder = field(6); g_manage = field(7);
-        if (parts.size() > 8) g_voiceLabel = field(8);
-        if (parts.size() > 9) g_micLabel = field(9);
-        if (parts.size() > 10) g_soundLabel = field(10);
-        if (parts.size() > 11) g_nearbyLabel = field(11);
-        if (parts.size() > 12) g_noNearbyLabel = field(12);
-        if (parts.size() > 13) g_membersLabel = field(13);
-        if (parts.size() > 14) g_settingsLabel = field(14);
-        if (parts.size() > 15) g_copyLabel = field(15);
-        if (parts.size() > 16) g_leaveLabel = field(16);
-        InvalidateRect(g_hwnd, nullptr, FALSE);
-    } else if (cmd == "VOICE") {
-        g_voiceEnabled = (field(1) == L"1");
-        g_muted = (field(2) == L"1");
-        g_deafened = (field(3) == L"1");
-        InvalidateRect(g_hwnd, nullptr, FALSE);
-    } else if (cmd == "PROX_STATUS") {
-        g_proxVoiceStatus = field(1);
-        g_proxVoiceTone = ToInt(field(2), 0);
-        InvalidateRect(g_hwnd, nullptr, FALSE);
-    } else if (cmd == "NEARBY_CLEAR") {
-        g_nearbyPlayers.clear();
-        g_nearbyCount = 0;
-        InvalidateRect(g_hwnd, nullptr, FALSE);
-    } else if (cmd == "NEARBY_PLAYER") {
-        NearbyPlayerNative p;
-        p.userId = field(1);
-        p.username = field(2);
-        p.distance = ToDouble(field(3), 0.0);
-        p.speaking = (field(4) == L"1");
-        p.muted = (field(5) == L"1");
-        p.volume = ToDouble(field(6), 1.0);
-        p.language = field(7);
-        p.server = field(8);
-        g_nearbyPlayers.push_back(std::move(p));
-        g_nearbyCount = (int)g_nearbyPlayers.size();
-        InvalidateRect(g_hwnd, nullptr, FALSE);
-    } else if (cmd == "GROUP_DETAIL") {
-        g_groupActive = (field(1) == L"1");
-        g_groupName = field(2);
-        g_groupInvite = field(3);
-        g_groupMax = std::max(1, ToInt(field(4), 25));
-        InvalidateRect(g_hwnd, nullptr, FALSE);
-    } else if (cmd == "GROUP_MEMBERS_CLEAR") {
-        g_groupMembers.clear();
-        InvalidateRect(g_hwnd, nullptr, FALSE);
-    } else if (cmd == "GROUP_MEMBER") {
-        GroupMemberNative gm;
-        gm.username = field(1);
-        gm.owner = (field(2) == L"1");
-        gm.language = field(3);
-        gm.server = field(4);
-        g_groupMembers.push_back(std::move(gm));
         InvalidateRect(g_hwnd, nullptr, FALSE);
     } else if (cmd == "QUIT") {
         PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
@@ -907,15 +510,64 @@ static DWORD WINAPI PipeReaderThread(LPVOID) {
     return 0;
 }
 
+static void InitParentWatchFromEnvironment() {
+    wchar_t buf[64]{};
+    DWORD n = GetEnvironmentVariableW(
+        L"SSO_RPC_PARENT_PID",
+        buf,
+        static_cast<DWORD>(sizeof(buf) / sizeof(buf[0]))
+    );
+    if (n == 0 || n >= (sizeof(buf) / sizeof(buf[0]))) return;
+
+    wchar_t* end = nullptr;
+    unsigned long value = wcstoul(buf, &end, 10);
+    if (!value || end == buf) return;
+
+    g_parentPid = static_cast<DWORD>(value);
+    g_parentProcess = OpenProcess(
+        SYNCHRONIZE,
+        FALSE,
+        g_parentPid
+    );
+}
+
+static bool ParentIsGone() {
+    if (!g_parentPid) return false;
+
+    if (!g_parentProcess) {
+        g_parentProcess = OpenProcess(
+            SYNCHRONIZE,
+            FALSE,
+            g_parentPid
+        );
+        if (!g_parentProcess) {
+            return GetLastError() == ERROR_INVALID_PARAMETER;
+        }
+    }
+
+    return WaitForSingleObject(
+        g_parentProcess,
+        0
+    ) == WAIT_OBJECT_0;
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE:
         SetTimer(hwnd, TIMER_GAME_MODE, 50, nullptr);
+        SetTimer(hwnd, TIMER_PARENT_WATCH, 250, nullptr);
         return 0;
     case WM_TIMER:
-        if (wp == TIMER_GAME_MODE && g_visible && !g_gameMode && IsStarStableForeground()) {
-            ApplyGameMode(true);
-            SendEvent("GAMEMODE");
+        if (wp == TIMER_PARENT_WATCH) {
+            if (ParentIsGone()) {
+                PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            }
+            return 0;
+        }
+
+        if (wp == TIMER_GAME_MODE) {
+            // v2.2 : pas de bascule automatique de l'interface.
+            return 0;
         }
         return 0;
     case WM_PIPE_LINE: {
@@ -927,59 +579,43 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_gameMode) return MA_NOACTIVATE;
         break;
     case WM_NCHITTEST:
+        // IMPORTANT : aucun changement de mode dans WM_NCHITTEST.
+        // En mode interactif, tous les contrôles reçoivent normalement la souris.
         if (g_gameMode) return HTTRANSPARENT;
         return HTCLIENT;
+    case WM_RBUTTONDOWN:
+        if (!g_gameMode) {
+            ReturnToPreviousWindow();
+        }
+        return 0;
+
     case WM_LBUTTONDOWN: {
         if (g_gameMode) return 0;
         int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
+
+        // Clic dans le grand panneau de messages = retour volontaire au jeu.
+        // Les onglets, le champ texte, Envoyer, Gérer groupe et Fermer restent
+        // traités normalement plus bas. Le clic de retour est consommé une fois ;
+        // le clic suivant agit directement dans SSO.
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        UpdateRects(client.right - client.left, client.bottom - client.top);
+        RectI messageArea{18, 101, client.right - 18, client.bottom - 74};
+        if (messageArea.contains(x, y)) {
+            ReturnToPreviousWindow();
+            return 0;
+        }
+
         SetFocus(hwnd);
-
         if (g_closeRect.contains(x,y)) { HideOverlay(); return 0; }
-        if (g_settingsRect.contains(x,y)) { SendEvent("LEGACY_SETTINGS"); HideOverlay(); return 0; }
-        if (g_minRect.contains(x,y)) {
-            SetWindowPos(hwnd, HWND_TOPMOST, 0,0, 620, 430, SWP_NOMOVE | SWP_NOACTIVATE);
-            InvalidateRect(hwnd,nullptr,FALSE); return 0;
-        }
-        if (g_maxRect.contains(x,y)) {
-            SetWindowPos(hwnd, HWND_TOPMOST, 0,0, 920, 560, SWP_NOMOVE | SWP_NOACTIVATE);
-            InvalidateRect(hwnd,nullptr,FALSE); return 0;
-        }
-        if (g_voiceToggleRect.contains(x,y)) { SendEvent("VOICE_TOGGLE"); return 0; }
-        if (g_micRect.contains(x,y)) { SendEvent("MUTE_TOGGLE"); return 0; }
-        if (g_deafRect.contains(x,y)) { SendEvent("DEAF_TOGGLE"); return 0; }
-
+        if (g_manageRect.contains(x,y)) { SendEvent("LEGACY"); HideOverlay(); return 0; }
         std::wstring keys[4] = {L"general",L"server",L"proximity",L"group"};
         for (int i=0;i<4;i++) if (g_tabRects[i].contains(x,y)) {
-            g_channel = keys[i];
-            SendEvent("CHANNEL", {g_channel});
-            InvalidateRect(hwnd,nullptr,FALSE);
-            return 0;
+            g_channel = keys[i]; SendEvent("CHANNEL", {g_channel}); InvalidateRect(hwnd,nullptr,FALSE); return 0;
         }
-
-        if (g_channel == L"group" && !g_groupActive && g_manageRect.contains(x,y)) {
-            SendEvent("LEGACY_GROUP");
-            HideOverlay();
-            return 0;
-        }
-        if (g_channel == L"group" && g_groupActive) {
-            if (g_groupCopyRect.contains(x,y)) { CopyUnicodeText(g_groupInvite); return 0; }
-            if (g_groupLeaveRect.contains(x,y)) { SendEvent("GROUP_LEAVE"); return 0; }
-        }
-
-        for (size_t i=0; i<g_nearbyMuteRects.size() && i<g_nearbyPlayers.size(); ++i) {
-            if (g_nearbyMuteRects[i].contains(x,y)) {
-                SendEvent("PROX_MUTE", {g_nearbyPlayers[i].userId});
-                return 0;
-            }
-        }
-
         if (g_sendRect.contains(x,y)) { SubmitInput(); return 0; }
         if (g_titleDragRect.contains(x,y)) {
-            g_dragging = true;
-            SetCapture(hwnd);
-            GetCursorPos(&g_dragStart);
-            GetWindowRect(hwnd,&g_windowStart);
-            return 0;
+            g_dragging = true; SetCapture(hwnd); GetCursorPos(&g_dragStart); GetWindowRect(hwnd,&g_windowStart); return 0;
         }
         return 0;
     }
@@ -997,7 +633,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_KEYDOWN:
         if (g_gameMode) return 0;
         if ((GetKeyState(VK_CONTROL) & 0x8000) && wp == 'V') { PasteClipboard(); return 0; }
-        if (wp == VK_ESCAPE) { ApplyGameMode(true); return 0; }
+        if (wp == VK_ESCAPE) { ReturnToPreviousWindow(); return 0; }
         if (wp == VK_RETURN) { SubmitInput(); return 0; }
         if (wp == VK_BACK && !g_input.empty()) { g_input.pop_back(); InvalidateRect(hwnd,nullptr,FALSE); return 0; }
         return 0;
@@ -1029,6 +665,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_DESTROY:
         KillTimer(hwnd, TIMER_GAME_MODE);
+        KillTimer(hwnd, TIMER_PARENT_WATCH);
+
+        if (g_parentProcess) {
+            CloseHandle(g_parentProcess);
+            g_parentProcess = nullptr;
+        }
+
         SendEvent("EXIT");
         PostQuitMessage(0);
         return 0;
@@ -1049,7 +692,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     SetProcessDPIAware();
     g_stdout = GetStdHandle(STD_OUTPUT_HANDLE);
 
-    const wchar_t* cls = L"SSONativeChatOverlayV3";
+    InitParentWatchFromEnvironment();
+
+    const wchar_t* cls = L"SSONativeChatOverlayV1";
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
     wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -1065,20 +710,14 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     g_fontName = MakeFont(13, FW_BOLD);
     g_fontText = MakeFont(12, FW_NORMAL);
     g_fontSmall = MakeFont(10, FW_NORMAL);
-    g_fontTiny = MakeFont(9, FW_NORMAL);
 
-    Gdiplus::GdiplusStartupInput gdiplusInput;
-    if (Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusInput, nullptr) == Gdiplus::Ok) {
-        LoadAssets();
-    }
-
-    int w = 920, h = 560;
+    int w = 760, h = 560;
     int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
     int x = std::max(20, (sw - w) / 2);
     int y = std::max(20, (sh - h) / 2);
 
     DWORD ex = WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT;
-    g_hwnd = CreateWindowExW(ex, cls, L"Chat & Vocal Star Stable", WS_POPUP,
+    g_hwnd = CreateWindowExW(ex, cls, L"Chat Star Stable", WS_POPUP,
         x, y, w, h, nullptr, nullptr, inst, nullptr);
     if (!g_hwnd) return 3;
 
@@ -1102,8 +741,5 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     if (g_fontName) DeleteObject(g_fontName);
     if (g_fontText) DeleteObject(g_fontText);
     if (g_fontSmall) DeleteObject(g_fontSmall);
-    if (g_fontTiny) DeleteObject(g_fontTiny);
-    g_icons.clear();
-    if (g_gdiplusToken) Gdiplus::GdiplusShutdown(g_gdiplusToken);
     return 0;
 }
