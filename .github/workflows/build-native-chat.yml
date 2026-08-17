@@ -23,7 +23,6 @@ jobs:
         shell: cmd
         run: >-
           cl /nologo /std:c++17 /O2 /EHsc /MT /utf-8
-          /DUNICODE /D_UNICODE
           native_chat\native_chat_overlay.cpp
           user32.lib gdi32.lib
           /link /SUBSYSTEM:WINDOWS
