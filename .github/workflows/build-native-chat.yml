@@ -24,7 +24,7 @@ jobs:
         run: >-
           cl /nologo /std:c++17 /O2 /EHsc /MT /utf-8
           native_chat\native_chat_overlay.cpp
-          user32.lib gdi32.lib
+          user32.lib gdi32.lib gdiplus.lib
           /link /SUBSYSTEM:WINDOWS
           /OUT:native_chat\native_chat_overlay.exe
 
